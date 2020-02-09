@@ -1,287 +1,158 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Produce an organized collection based on an SMDB file.
+
+Requires libarchive ( https://pypi.org/project/libarchive/ ).  E.g.:
+
+  $ virtualenv --python=python3 env
+  $ ./env/bin/pip install libarchive
+
+
+Then, usage:
+
+  $ ./env/bin/python build_pack.py <SMDB.txt> <source> <destination>
+
+
+The source will be searched recursively, including recursively inside
+archives.  The source may be a directory or an archive file.  So if you have,
+for some silly reason, a RAR full of 7Z full of files, they'll all be found.
+The destination will be filled with files from from the source, named as the the
+SMDB.txt file dictates, wherever they are found.
+
+The destination must be an existing directory.
 """
-use a database to identify and organize files.
-"""
-import os
-import sys
-import shutil
+
+import glob
 import hashlib
-import argparse
-import zipfile
-from collections import defaultdict
-from collections import Counter
+import io
+import os
+import pathlib
+import shutil
+import sys
+
+import libarchive.exception
+import libarchive.public
 
 
-__author__ = "aquaman"
-__date__ = "2019/09/30"
-__version__ = "$Revision: 3.3"
+DB = {}
+FOUND = set()
+
+# TODO: Options.
+#   Overwrite: never, if different.
 
 
-# *********************************************************************#
-#                                                                      #
-#                            Functions                                 #
-#                                                                      #
-# *********************************************************************#
-
-if __name__ == '__main__':
-    """
-    Parse arguments from command line.
-    """
-    parser = argparse.ArgumentParser(
-        description="use a database to identify and organize files.")
-    # Add support for boolean arguments. Allows us to accept 1-argument forms
-    # of boolean flags whose values are any of "yes", "true", "t" or "1".
-    parser.register('type', 'bool', (lambda x: x.lower() in
-                                     ("yes", "true", "t", "1")))
-
-    parser.add_argument("-i", "--input_folder",
-                        dest="source_folder",
-                        required=True,
-                        help="set source folder")
-
-    parser.add_argument("-d", "--database",
-                        dest="target_database",
-                        required=True,
-                        help="set target database")
-
-    parser.add_argument("-o", "--output_folder",
-                        dest="output_folder",
-                        required=True,
-                        help="set output folder")
-
-    parser.add_argument("-m", "--missing",
-                        dest="missing_files",
-                        default=None,
-                        help="list missing files")
-
-    parser.add_argument("--file_strategy",
-                        choices=["copy", "hardlink"],
-                        dest="file_strategy",
-                        default="copy",
-                        help=("Strategy for how to get files into the output "
-                              "folder."))
-
-    # Valid uses of this flag include: -s, -s true, -s yes, --skip_existing=1
-    parser.add_argument("-s", "--skip_existing",
-                        dest="skip_existing",
-                        default=False,
-                        # nargs and const below allow us to accept the
-                        # zero-argument form of --skip_existing
-                        nargs="?",
-                        const=True,
-                        type='bool',
-                        help=("Skip files which already exist at the "
-                              "destination without overwriting them."))
-
-    # Valid uses of this flag include: -l, -l true, -l yes, --new_line=1
-    parser.add_argument("-l", "--new_line",
-                        dest="new_line",
-                        default=False,
-                        # nargs and const below allow us to accept the
-                        # zero-argument form of --skip_existing
-                        nargs="?",
-                        const=True,
-                        type='bool',
-                        help=("Changes the way the stdout is printed, and "
-                              "allows for UI subprocess monitoring."))
-
-    ARGS = parser.parse_args()
+def hash_file(path):
+  h = hashlib.sha256()
+  with open(path, 'rb') as f:
+    for chunk in iter(lambda: f.read(4096), b''):
+      h.update(chunk)
+  return h.digest()
 
 
-def copy_file(source, dest):
-    """Get a file from source to destination, with a configurable strategy.
+def hash_mem(buf):
+  h = hashlib.sha256()
+  h.update(buf)
+  return h.digest()
 
-    This method makes a file at source additionally appear at dest. The way
-    this is accomplished is controlled via the --file_strategy command.
 
-    Args:
-      source - The file to copy/hardlink
-      dest - The destination that the new file should appear at
-    """
-    if ARGS.file_strategy == "copy":
-        copy_fn = shutil.copyfile
-    elif ARGS.file_strategy == "hardlink":
-        copy_fn = os.link
-    else:
-        raise Exception("Unknown copy strategy {}".format(ARGS.file_strategy))
+def load_smdb(smdb):
+  """Load data from an SMDB text file."""
+  global DB
+  DB = {}
+  with open(smdb, 'r') as f:
+    for line in f:
+      sha256, filename, sha1, md5, crc = line.strip().split('\t', 4)
+      if len(sha256) != 64:
+        raise ValueError('Expected a SHA256 sum, got %r!' % sha256)
+      DB[bytes(bytearray.fromhex(sha256))] = filename
 
+
+def read_archive(source, destination):
+  if isinstance(source, bytes):
+    c = libarchive.public.memory_reader
+  else:
+    c = libarchive.public.file_reader
+
+  with c(source) as i:
+    for entry in i:
+      # libarchive only streams, we can't re-read already-read blocks.
+      # we want to read twice (1: hash, then 2: maybe write).
+      # so read the whole file into memory?  ick.
+      buf = b''
+      for b in entry.get_blocks():
+        buf += b
+
+      try:
+        read_archive(buf, destination)
+      except (ValueError, libarchive.exception.ArchiveError):
+        read_file(buf, destination)
+
+
+def read_dir(source, destination):
+  for path in glob.glob(os.path.join(source, '*')):
+    if os.path.isdir(path):
+      read_dir(path, destination)
+    elif os.path.isfile(path):
+      read_file(path, destination)
+
+
+def read_file(source, destination):
+  if isinstance(source, bytes):
+    h = hash_mem(source)
+    write_file(source, destination, h)
+  elif os.path.isfile(source):
     try:
-        # copy the file to the new directory
-        copy_fn(source, dest)
-    except FileNotFoundError:
-        # Windows' default API is limited to paths of 260 characters
-        fixed_dest = u'\\\\?\\' + os.path.abspath(dest)
-        copy_fn(source, fixed_dest)
+      read_archive(source, destination)
+    except (ValueError, libarchive.exception.ArchiveError):
+      h = hash_file(source)
+      write_file(source, destination, h)
+  else:
+    print('What is it!?')
 
 
-def extract_file(filename, entry, method, dest):
-    """
-    extracts entry from archive to given destination directory
-    """
-    if method == 'zip':
-        try:
-            # extract the file to the new directory
-            zipfile.ZipFile(filename).extract(entry, os.path.dirname(dest))
-            filename = os.path.join(os.path.dirname(dest), entry)
-            if filename != dest:
-                os.replace(filename, dest)
-        except FileNotFoundError:
-            # Windows' default API is limited to paths of 260 characters
-            fixed_dest = u'\\\\?\\' + os.path.abspath(dest)
-            zipfile.ZipFile(filename).extract(entry, os.path.dirname(fixed_dest))
+def write_file(source, destination, h):
+  if h not in DB:
+    return
+  FOUND.add(h)
+  out_path = os.path.join(destination, DB[h])
+  out_dir = os.path.dirname(out_path)
+  pathlib.Path(out_dir).mkdir(parents=True, exist_ok=True)
+  if os.path.exists(out_path):
+    return
+  if isinstance(source, bytes):
+    with open(out_path, 'wb') as f:
+      f.write(source)
+  else:
+    shutil.copyfile(source, out_path)
 
 
-def parse_database(target_database):
-    """
-    store hash values and filenames in a database.
-    """
-    db = defaultdict(list)  # missing key's default value is an empty list
-    number_of_entries = 0
-    with open(target_database, "r") as target_database:
-        for line in target_database:
-            hash_sha256, filename, _, _, hash_crc = line.strip().split("\t", 4)
-            number_of_entries += 1
-            filename = os.path.normpath(filename)
-            db[hash_sha256].append(filename)
-            db[hash_crc].append(filename)
-    return db, number_of_entries
+def main():
+  try:
+    smdb, source, destination = sys.argv[1:]
+  except Valuerror:
+    return usage()
 
+  if not os.path.isdir(destination):
+    print('Error: destination %r does not exist' % destination, file=sys.stderr)
+    return
 
-def print_progress(current, end):
-    print_function("processing file: {:>9}".format(current), end=end)
+  try:
+    load_smdb(smdb)
+  except ValueError as e:
+    print('Error: could not read SMDB! (%s)' % e, file=sys.stderr)
+    return
 
+  if os.path.isdir(source):
+    read_dir(source, destination)
+  elif os.path.isfile(source):
+    read_file(source, destination)
 
-def print_function(text, end, file=sys.stdout, flush=True):
-    print(text, end=end, file=file, flush=flush)
+  print('Done.')
+  print('SMDB lists %d files.' % len(DB))
+  print(
+      'Found %d files (%.2f%%).'
+      % (len(FOUND), 100 * float(len(FOUND)) / float(len(DB))))
 
-
-def parse_folder(source_folder, db, output_folder):
-    """
-    read each file, produce a hash value and place it in the directory tree.
-    """
-    i = 0
-    for dirpath, dirnames, filenames in os.walk(source_folder):
-        if filenames:
-            for f in filenames:
-                filename = os.path.join(os.path.normpath(dirpath),
-                                        os.path.normpath(f))
-                absolute_filename = u'\\\\?\\' + os.path.abspath(filename)
-                try:
-                    hashes = get_hashes(filename)
-                except FileNotFoundError:
-                    hashes = get_hashes(absolute_filename)
-
-                for h, info in hashes.items():
-                    if h in db:
-                        # we have a hit
-                        for entry in db[h]:
-                            new_path = os.path.join(output_folder,
-                                                    os.path.dirname(entry))
-                            # create directory structure if need be
-                            if not os.path.exists(new_path):
-                                os.makedirs(new_path, exist_ok=True)
-                            new_file = os.path.join(output_folder, entry)
-                            if (not ARGS.skip_existing or not
-                                    os.path.exists(new_file)):
-                                if info['archive']:
-                                    # extract file from archive to directory
-                                    extract_file(info['filename'],
-                                                 info['archive']['entry'],
-                                                 info['archive']['type'],
-                                                 new_file)
-                                else:
-                                    # copy the file to the new directory
-                                    copy_file(info['filename'], new_file)
-                        # remove the hit from the database
-                        del db[h]
-
-                    i += 1
-                    print_progress(i, END_LINE)
-    else:
-        if not ARGS.new_line:
-            print_progress(i, "\n")
-
-
-def get_hashes(filename):
-    """
-    return dictionary of hashes containing:
-        - sha256 hash of the file itself
-        - additional hashes if the file is a compressed archive
-    """
-    hashes = {}
-    h = hashlib.sha256()
-
-    # hash the file itself
-    with open(filename, "rb", buffering=0) as f:
-        # use a small buffer to compute hash to
-        # avoid memory overload
-        for b in iter(lambda: f.read(128 * 1024), b''):
-            h.update(b)
-
-    # add file hash to dict
-    hashes[h.hexdigest()] = {
-        'filename': filename,
-        'archive': None
-    }
-
-    # if this is a zipfile, extract CRCs from header
-    if zipfile.is_zipfile(filename):
-        try:
-            with zipfile.ZipFile(filename, 'r') as z:
-                for info in z.infolist():
-                    # add archive entry hash to dict
-                    hashes[hex(info.CRC).lstrip('0x')] = {
-                        'filename': filename,
-                        'archive': {
-                            'entry': info.filename,
-                            'type': 'zip'
-                        }
-                    }
-        except OSError:  # normal file containing a zip magic number?
-            pass
-
-    return hashes
-
-
-# *********************************************************************#
-#                                                                      #
-#                              Body                                    #
-#                                                                      #
-# *********************************************************************#
 
 if __name__ == '__main__':
-    SOURCE_FOLDER = ARGS.source_folder
-    TARGET_DATABASE = ARGS.target_database
-    OUTPUT_FOLDER = ARGS.output_folder
-    MISSING_FILES = ARGS.missing_files
-    END_LINE = "\n" if ARGS.new_line else "\r"
-    DATABASE, NUMBER_OF_ENTRIES = parse_database(TARGET_DATABASE)
-    parse_folder(SOURCE_FOLDER, DATABASE, OUTPUT_FOLDER)
-    FOUND_ENTRIES = NUMBER_OF_ENTRIES
-    if MISSING_FILES:
-        # Observed files will have either the SHA256 or the CRC32
-        # entry deleted (or both). Missing files will have both
-        # entries. So, search for filenames occuring twice.
-        d = Counter([str(i) for i in DATABASE.values()])
-        d2 = set([str(i) for i in d if d[i] == 2])
-        # Each missing file is listed twice, keep only the SHA256 entry (64 chars)
-        list_of_missing_files = [(os.path.basename(DATABASE[entry][0]), entry)
-                                 for entry in DATABASE
-                                 if str(DATABASE[entry]) in d2 and len(entry) == 64]
-        FOUND_ENTRIES = NUMBER_OF_ENTRIES - len(list_of_missing_files)
-        if list_of_missing_files:
-            list_of_missing_files.sort()
-            with open(MISSING_FILES, "w") as missing_files:
-                for missing_file, entry in list_of_missing_files:
-                    print(missing_file, entry, sep="\t", file=missing_files)
-        else:
-            print("no missing file")
-
-    COVERAGE = round(100.0 * FOUND_ENTRIES / NUMBER_OF_ENTRIES, 2)
-    print('coverage: {}/{} ({}%)'.format(FOUND_ENTRIES,
-                                         NUMBER_OF_ENTRIES,
-                                         COVERAGE),
-          file=sys.stdout)
-
-    sys.exit(0)
+  main()
