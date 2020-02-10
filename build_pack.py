@@ -60,11 +60,13 @@ def load_smdb(smdb):
   global DB
   DB = {}
   with open(smdb, 'r') as f:
-    for line in f:
-      sha256, filename, sha1, md5, crc = line.strip().split('\t', 4)
-      if len(sha256) != 64:
-        raise ValueError('Expected a SHA256 sum, got %r!' % sha256)
-      DB[bytes(bytearray.fromhex(sha256))] = filename
+    lines = f.readlines()
+    lines.sort(key=lambda l: l[65:], reverse=True)
+  for line in lines:
+    sha256, filename, sha1, md5, crc = line.strip().split('\t', 4)
+    if len(sha256) != 64:
+      raise ValueError('Expected a SHA256 sum, got %r!' % sha256)
+    DB[bytes(bytearray.fromhex(sha256))] = filename
 
 
 def read_archive(source, destination):
