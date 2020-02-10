@@ -35,6 +35,7 @@ import libarchive.public
 
 
 DB = {}
+DIR = None
 FOUND = set()
 
 # TODO: Options.
@@ -67,6 +68,8 @@ def load_smdb(smdb):
     if len(sha256) != 64:
       raise ValueError('Expected a SHA256 sum, got %r!' % sha256)
     DB[bytes(bytearray.fromhex(sha256))] = filename
+  global DIR
+  DIR = next(iter(DB.values())).split('/')[0]
 
 
 def read_archive(source, destination):
@@ -158,6 +161,14 @@ def main():
   print(
       'Found %d files (%.2f%%).'
       % (len(FOUND), 100 * float(len(FOUND)) / float(len(DB))))
+
+  missing_path = os.path.join(destination, DIR, 'missing.txt')
+  pathlib.Path(os.path.dirname(missing_path)).mkdir(parents=True, exist_ok=True)
+  with open(missing_path, 'w') as f:
+    for h, n in sorted(DB.items(), key=lambda kv: kv[1]):
+      if h not in FOUND:
+        f.write(n)
+        f.write('\n')
 
 
 if __name__ == '__main__':
