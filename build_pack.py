@@ -10,14 +10,14 @@ Requires libarchive ( https://pypi.org/project/libarchive/ ).  E.g.:
 
 Then, usage:
 
-  $ ./env/bin/python build_pack.py <SMDB.txt> <source> <destination>
+  $ ./env/bin/python build_pack.py <SMDB.txt> <destination> <source> [source] ...
 
 
-The source will be searched recursively, including recursively inside
-archives.  The source may be a directory or an archive file.  So if you have,
-for some silly reason, a RAR full of 7Z full of files, they'll all be found.
-The destination will be filled with files from from the source, named as the the
-SMDB.txt file dictates, wherever they are found.
+The source(s) will be searched, including recursively inside archives.  Each
+source may be a directory or an archive file.  So if you have, for some silly
+reason, a RAR full of 7Z full of files, they'll all be found. The destination
+will be filled with files from from the source, named as the the SMDB.txt file
+dictates, wherever they are found.
 
 The destination must be an existing directory.
 """
@@ -127,9 +127,12 @@ def write_file(source, destination, h):
 
 
 def main():
+  args = sys.argv[1:]
   try:
-    smdb, source, destination = sys.argv[1:]
-  except Valuerror:
+    smdb = args.pop(0)
+    destination = args.pop(0)
+    sources = args
+  except IndexError:
     return usage()
 
   if not os.path.isdir(destination):
@@ -142,10 +145,11 @@ def main():
     print('Error: could not read SMDB! (%s)' % e, file=sys.stderr)
     return
 
-  if os.path.isdir(source):
-    read_dir(source, destination)
-  elif os.path.isfile(source):
-    read_file(source, destination)
+  for source in sources:
+    if os.path.isdir(source):
+      read_dir(source, destination)
+    elif os.path.isfile(source):
+      read_file(source, destination)
 
   print('Done.')
   print('SMDB lists %d files.' % len(DB))
