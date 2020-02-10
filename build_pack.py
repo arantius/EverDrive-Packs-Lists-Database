@@ -81,7 +81,7 @@ def read_archive(source, destination):
   with c(source) as i:
     for entry in i:
       # libarchive only streams, we can't re-read already-read blocks.
-      # we want to read twice (1: hash, then 2: maybe write).
+      # we want to read twice (1: hash, then maybe 2: write).
       # so read the whole file into memory?  ick.
       buf = b''
       for b in entry.get_blocks():
@@ -111,8 +111,6 @@ def read_file(source, destination):
     except (ValueError, libarchive.exception.ArchiveError):
       h = hash_file(source)
       write_file(source, destination, h)
-  else:
-    print('What is it!?')
 
 
 def write_file(source, destination, h):
